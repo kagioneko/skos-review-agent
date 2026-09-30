@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fetch": {"command": "uvx", "args": ["mcp-server-fetch==2025.4.7"]},
+    "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@2026.1.14", "~"]},
+    "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github@2025.4.8"],
+               "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}}
+  }
+}
