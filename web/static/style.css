@@ -21,3 +21,4 @@ pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); padd
 .hold { border: 2px solid var(--hold); border-radius: 8px; padding: 10px; margin: 8px 0; }
 .hold strong { color: var(--hold); }
 .ok { color: var(--ok); } .bad { color: var(--hold); }
+.banner { padding: 6px 10px; border-left: 3px solid var(--accent); background: var(--bg); }

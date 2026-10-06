@@ -38,9 +38,10 @@ class Runtime:
         self._runners: dict[str, InMemoryRunner] = {}
         self._sessions: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
-    def _runner(self, sid: str) -> InMemoryRunner:
-        # offline: a fresh scripted model per session so each demo replays
-        if offline_mode():
+    def _runner(self, scripted: bool) -> InMemoryRunner:
+        # scripted (or offline): a fresh scripted model per session so each
+        # demo replays - it plays a model that falls for the injection
+        if scripted or offline_mode():
             from agent.offline import demo_model
 
             model: Any = demo_model()
@@ -63,10 +64,10 @@ class Runtime:
         self._sessions.pop(sid, None)
         self._runners.pop(sid, None)
 
-    async def create(self, config_text: str) -> str:
+    async def create(self, config_text: str, scripted: bool = False) -> str:
         self._expire()
         sid = uuid.uuid4().hex
-        runner = self._runner(sid)
+        runner = self._runner(scripted)
         await runner.session_service.create_session(
             app_name=APP, user_id=sid, session_id=sid,
             state={"user:mcp_config": config_text},

@@ -76,3 +76,27 @@ def test_invalid_config_is_reported_without_values(client: TestClient) -> None:
     ]
     res = client.post("/api/chat", json={"session_id": sid, "message": "review"})
     assert secret not in res.text
+
+
+def test_session_reports_scripted_mode(client: TestClient) -> None:
+    res = client.post("/api/session", json={"config": None, "scripted": False}).json()
+    assert res["scripted"] is True  # offline server: every session is scripted
+
+
+def test_scripted_session_replays_the_injection_without_gemini() -> None:
+    import asyncio
+
+    from agent.runtime import Runtime
+    from web.server import SAMPLE
+
+    async def go() -> tuple[dict, dict]:
+        rt = Runtime()
+        sid = await rt.create(SAMPLE, scripted=True)
+        res = await rt.chat(sid, "review")
+        hold = next(s for s in res["steps"] if s["kind"] == "hold")
+        return res, await rt.confirm(sid, hold["confirmation_id"], False)
+
+    res, after = asyncio.run(go())
+    assert res["gate"]["holds"][-1]["reason"].startswith("CAPGRAPH-001")
+    assert res["outbox"] == [] and after["outbox"] == []
+    assert any(s["kind"] == "text" and "台本モード" in s["text"] for s in after["steps"])

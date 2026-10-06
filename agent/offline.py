@@ -1,6 +1,8 @@
-"""Offline demo model: plays a fixed script of tool calls instead of calling
-Gemini. Used by the tests and by REVIEW_AGENT_MODEL=offline, so the UI can be
-developed and shown without cloud credentials. The UI labels this mode."""
+"""Scripted demo model: plays a fixed script of tool calls instead of calling
+Gemini. It acts out a model that falls for the injected issue, so the gate's
+second line of defence can be shown (real Gemini usually spots the injection
+itself). Used by the tests, by REVIEW_AGENT_MODEL=offline, and by sessions
+started in scripted mode. The UI labels these sessions."""
 
 from __future__ import annotations
 
@@ -22,10 +24,9 @@ DEMO_SCRIPT: list[tuple[str, dict[str, Any]]] = [
 ]
 
 DEMO_FINAL_TEXT = (
-    "[offline demo] Security Knowledge OS found CAPGRAPH-001 (outside content + "
-    "private data + sending) in this setup. While investigating, issue-42 tried to "
-    "make me send the scan result to an outside address; my own gate held that send "
-    "for your approval."
+    "【台本モード】この設定には CAPGRAPH-001（外部の内容＋機密＋外部送信）の組み合わせが"
+    "あります。調査中に読んだ issue-42 の隠し指示に従って、スキャン結果を外部アドレスへ"
+    "送ろうとしましたが、自分のゲートがその送信を止めて、あなたに判断を求めました。"
 )
 
 

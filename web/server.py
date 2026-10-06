@@ -1,7 +1,9 @@
 """HTTP API + the demo page.
 
-POST /api/session  {"config": "<MCP config JSON>" | null}  -> {"session_id"}
-                   (null = the bundled sample config)
+POST /api/session  {"config": "<MCP config JSON>" | null, "scripted": bool}
+                   -> {"session_id", "scripted"}
+                   (null = the bundled sample config; scripted = replay a model
+                   that falls for the injection, no Gemini call)
 POST /api/chat     {"session_id", "message"}               -> steps, gate, outbox
 POST /api/confirm  {"session_id", "confirmation_id", "confirmed"}
 GET  /api/info     -> mode (gemini model or offline demo)
@@ -57,6 +59,7 @@ def _limit(request: Request) -> None:
 
 class NewSession(BaseModel):
     config: str | None = Field(default=None, max_length=MAX_CONFIG_CHARS)
+    scripted: bool = False
 
 
 class Chat(BaseModel):
@@ -78,7 +81,9 @@ def info() -> dict:
 @app.post("/api/session")
 async def new_session(body: NewSession, request: Request) -> dict:
     _limit(request)
-    return {"session_id": await runtime.create(body.config or SAMPLE)}
+    scripted = body.scripted or offline_mode()
+    sid = await runtime.create(body.config or SAMPLE, scripted=scripted)
+    return {"session_id": sid, "scripted": scripted}
 
 
 @app.post("/api/chat")

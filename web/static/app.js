@@ -12,16 +12,24 @@ async function api(path, body) {
 }
 
 fetch("/api/info").then(r => r.json()).then(i => {
-  $("mode").textContent = i.mode === "offline-demo" ? "オフラインデモモード（Gemini を呼ばず、決まった台本で動きます）" : "モデル: " + i.model;
+  const offline = i.mode === "offline-demo";
+  $("mode").textContent = offline ? "オフラインデモモード（Gemini を呼ばず、決まった台本で動きます）" : "モデル: " + i.model;
+  if (offline) { const live = document.querySelector("input[name=run][value=live]"); live.disabled = true; document.querySelector("input[name=run][value=scripted]").checked = true; }
 });
 document.querySelectorAll("input[name=src]").forEach(r => r.addEventListener("change", () => { $("config").hidden = r.value !== "own" || !r.checked; }));
 
 $("start").onclick = async () => {
   const own = document.querySelector("input[name=src]:checked").value === "own";
+  const scripted = document.querySelector("input[name=run]:checked").value === "scripted";
   try {
-    const res = await api("/api/session", { config: own ? $("config").value : null });
+    const res = await api("/api/session", { config: own ? $("config").value : null, scripted });
     sid = res.session_id;
-    $("chatbox").hidden = false; $("views").hidden = false; $("timeline").replaceChildren(); render({ steps: [], gate: {}, outbox: [] });
+    $("chatbox").hidden = false; $("views").hidden = false; $("timeline").replaceChildren();
+    $("runbanner").textContent = res.scripted
+      ? "台本モード：Gemini は呼びません。仕込まれた指示に従ってしまうモデルを再生し、ゲートが止めるところを見せます。"
+      : "本物の Gemini で動いています。";
+    $("runbanner").hidden = false;
+    render({ steps: [], gate: {}, outbox: [] });
   } catch (e) { alert("開始できません: " + e.message); }
 };
 
