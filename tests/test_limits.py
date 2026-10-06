@@ -87,3 +87,89 @@ def test_live_budget_is_enforced_before_calling_gemini(monkeypatch: pytest.Monke
         await r.chat(scripted, "review")  # scripted sessions do not use the budget
 
     asyncio.run(go())
+
+
+def test_daily_budget_is_shared_through_the_counter() -> None:
+    # a restarted process builds a new LiveBudget; the shared counter keeps the count
+    import agent.runtime as rt
+
+    shared = rt.MemoryCounter()
+
+    async def go() -> None:
+        await rt.LiveBudget(daily=1, concurrency=1, counter=shared).take()
+        with pytest.raises(rt.Unavailable):
+            await rt.LiveBudget(daily=1, concurrency=1, counter=shared).take()
+
+    asyncio.run(go())
+
+
+def test_budget_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent.runtime as rt
+
+    async def go() -> None:
+        with pytest.raises(rt.Unavailable):
+            await rt.LiveBudget(daily=10, concurrency=1, counter=rt.BrokenCounter()).take()
+
+    asyncio.run(go())
+
+    def boom() -> None:
+        raise RuntimeError("no credentials")
+
+    monkeypatch.delenv("REVIEW_AGENT_BUDGET_STORE", raising=False)
+    monkeypatch.setenv("K_SERVICE", "skos-review-agent")  # on Cloud Run
+    monkeypatch.setattr(rt, "FirestoreCounter", boom)
+    assert isinstance(rt.budget_counter(), rt.BrokenCounter)
+    monkeypatch.delenv("K_SERVICE")
+    assert isinstance(rt.budget_counter(), rt.MemoryCounter)  # local run
+
+
+def _live_session_with_hold(r):  # type: ignore[no-untyped-def]
+    """A session that holds a send, then treated as live (no Gemini needed)."""
+    from web.server import SAMPLE
+
+    async def go():  # type: ignore[no-untyped-def]
+        sid = await r.create(SAMPLE, scripted=True)
+        res = await r.chat(sid, "review")
+        r._sessions[sid]["scripted"] = False
+        return sid, next(s for s in res["steps"] if s["kind"] == "hold")["confirmation_id"]
+
+    return go()
+
+
+def test_busy_live_slot_refuses_without_spending_anything() -> None:
+    import agent.runtime as rt
+
+    async def go() -> None:
+        r = rt.Runtime()
+        counter = rt.MemoryCounter()
+        r.budget = rt.LiveBudget(daily=5, concurrency=1, counter=counter)
+        sid, hid = await _live_session_with_hold(r)
+        turns = r._sessions[sid]["turns"]
+        async with r.budget.sem:  # someone else holds the only slot
+            with pytest.raises(rt.Unavailable):
+                await asyncio.wait_for(r.confirm(sid, hid, True), 1)  # refused, not queued
+            with pytest.raises(rt.Unavailable):
+                await asyncio.wait_for(r.chat(sid, "hi"), 1)
+        meta = r._sessions[sid]
+        assert hid in meta["pending"] and meta["turns"] == turns and counter._used == 0
+        await r.confirm(sid, hid, False)  # the slot is free again: the answer still counts
+        assert hid not in r._sessions[sid]["pending"] and counter._used == 1
+
+    asyncio.run(go())
+
+
+def test_failed_run_ends_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent.runtime as rt
+    from web.server import SAMPLE
+
+    monkeypatch.setattr(rt, "RUN_TIMEOUT", 0.0)
+
+    async def go() -> None:
+        r = rt.Runtime()
+        sid = await r.create(SAMPLE, scripted=True)
+        with pytest.raises(TimeoutError):
+            await r.chat(sid, "review")
+        with pytest.raises(KeyError):
+            await r.chat(sid, "again")
+
+    asyncio.run(go())

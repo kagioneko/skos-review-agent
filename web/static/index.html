@@ -17,7 +17,7 @@
   <section class="panel" id="setup">
     <h2>1. 診断する MCP 設定</h2>
     <label><input type="radio" name="src" value="sample" checked> サンプル設定（fetch / files / github）</label>
-    <label><input type="radio" name="src" value="own"> 自分の設定を貼り付ける（保存されません。秘密情報の値は結果に出ません）</label>
+    <label><input type="radio" name="src" value="own"> 自分の設定を貼り付ける（セッション中だけメモリに保持し、ログには残しません。診断用の一時ファイルは診断後すぐ削除。秘密情報の値は結果に出ません）</label>
     <textarea id="config" rows="6" placeholder='{"mcpServers": {...}}' hidden></textarea>
     <h3>エージェントの動かし方</h3>
     <label><input type="radio" name="run" value="live" checked> 本物の Gemini（多くの場合、仕込まれた指示を自分で見抜きます）</label>

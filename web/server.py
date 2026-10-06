@@ -121,33 +121,42 @@ class Guard:
             return await JSONResponse({"detail": "request too large"}, status_code=413)(
                 scope, receive, send
             )
-        seen = 0
-
-        async def limited():  # type: ignore[no-untyped-def]
-            nonlocal seen
+        # read the whole body here, counting bytes as they arrive, so an
+        # oversized stream is answered 413 before the app sees any of it
+        body = bytearray()
+        while True:
             message = await receive()
-            if message["type"] == "http.request":
-                seen += len(message.get("body", b""))
-                if seen > MAX_BODY:
-                    raise _TooLarge
-            return message
+            if message["type"] == "http.disconnect":
+                return None
+            body += message.get("body", b"")
+            if len(body) > MAX_BODY:
+                return await JSONResponse({"detail": "request too large"}, status_code=413)(
+                    scope, receive, send
+                )
+            if not message.get("more_body", False):
+                break
+        sent = False
 
-        try:
-            return await self.app(scope, limited, send)
-        except _TooLarge:
-            return await JSONResponse({"detail": "request too large"}, status_code=413)(
-                scope, receive, send
-            )
+        async def replay():  # type: ignore[no-untyped-def]
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        return await self.app(scope, replay, send)
 
 
-class _TooLarge(Exception):
-    pass
+_FIELDS = {"body", "config", "scripted", "session_id", "message", "confirmation_id", "confirmed"}
 
 
 @app.exception_handler(RequestValidationError)
 async def _invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
     # never echo the input (it may be a config with secrets): location and type only
-    errors = [{"loc": list(e.get("loc", ())), "type": e.get("type")} for e in exc.errors()]
+    errors = [
+        {"loc": [x if x in _FIELDS else "?" for x in e.get("loc", ())], "type": e.get("type")}
+        for e in exc.errors()
+    ]
     return JSONResponse({"detail": errors}, status_code=422)
 
 
@@ -197,7 +206,9 @@ async def _call(coro):  # type: ignore[no-untyped-def]
     except Unavailable as exc:
         raise HTTPException(503, str(exc)) from None
     except TimeoutError:
-        raise HTTPException(504, "the agent took too long; try again") from None
+        raise HTTPException(504, "the agent took too long; this session has ended") from None
+    except Exception:  # noqa: BLE001 - e.g. the model-call cap; no details echoed
+        raise HTTPException(500, "the agent stopped unexpectedly; this session has ended") from None
 
 
 @app.post("/api/chat")

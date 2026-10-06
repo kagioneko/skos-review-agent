@@ -8,9 +8,11 @@ let busy = false;
 const $ = (id) => document.getElementById(id);
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
 
+const detail = (d) => typeof d === "string" ? d : (Array.isArray(d) ? "入力が正しくありません" : "");
+
 async function api(path, body) {
   const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  if (!r.ok) { const e = new Error(detail((await r.json().catch(() => ({}))).detail) || r.statusText); e.status = r.status; throw e; }
   return r.json();
 }
 
@@ -98,10 +100,24 @@ function render(res) {
   $("outbox").replaceChildren(...(out.length ? out.map(o => el("li", o.destination + " ← " + o.body)) : [el("li", "空", "muted")]));
 }
 
-function answer(owner, id, ok, box) {
+// The approval card stays until the server has taken the answer: on 429/503
+// nothing was used up, so the user can answer again. 409 = already answered;
+// 504/500 = outcome unknown and the session has ended.
+async function answer(owner, id, ok, box) {
   if (busy || owner !== sid) return;
-  box.remove();
-  if (!$("holds").children.length) $("holds").replaceChildren(el("p", "なし", "muted"));
-  $("timeline").append(el("li", ok ? "あなた: 許可しました" : "あなた: 拒否しました"));
-  call("/api/confirm", { session_id: owner, confirmation_id: id, confirmed: ok }, owner);
+  setBusy(true);
+  try {
+    const res = await api("/api/confirm", { session_id: owner, confirmation_id: id, confirmed: ok });
+    if (owner !== sid) return;
+    box.remove();
+    $("timeline").append(el("li", ok ? "あなた: 許可しました" : "あなた: 拒否しました"));
+    render(res);
+  } catch (e) {
+    if (owner !== sid) return;
+    if (e.status !== 429 && e.status !== 503) box.remove();
+    $("timeline").append(el("li", "エラー: " + e.message, "bad"));
+  } finally {
+    if (!$("holds").children.length) $("holds").replaceChildren(el("p", "なし", "muted"));
+    setBusy(false);
+  }
 }

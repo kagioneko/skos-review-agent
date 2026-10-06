@@ -150,7 +150,7 @@ def test_confirm_needs_an_id_this_session_issued(client: TestClient) -> None:
 def test_validation_errors_do_not_echo_input(client: TestClient) -> None:
     canary = "SECRET_CANARY_123"
     for body in [{"config": canary + "x" * 50_001}, {"config": {"k": canary}},
-                 {"config": None, "extra": canary}]:
+                 {"config": None, "extra": canary}, {canary: None}]:
         r = client.post("/api/session", json=body)
         assert r.status_code == 422
         assert canary not in r.text
@@ -165,3 +165,15 @@ def test_oversized_body_is_refused_before_parsing(client: TestClient) -> None:
 def test_rate_limit_counts_requests_that_fail_validation(client: TestClient) -> None:
     codes = [client.post("/api/chat", json={}).status_code for _ in range(25)]
     assert codes[:20] == [422] * 20 and 429 in codes[20:]
+
+
+def test_streamed_oversized_body_is_refused_before_the_route(client: TestClient) -> None:
+    def chunks():  # type: ignore[no-untyped-def]
+        yield b'{"config": "'
+        for _ in range(40):
+            yield b"x" * 10_000
+        yield b'"}'
+
+    r = client.post("/api/session", content=chunks(), headers={"content-type": "application/json"})
+    assert "content-length" not in r.request.headers
+    assert r.status_code == 413

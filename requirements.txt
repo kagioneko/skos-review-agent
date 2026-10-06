@@ -1,5 +1,8 @@
 google-adk==2.10.0
 google-genai==2.25.0
+google-cloud-firestore==2.34.0
+google-api-core==2.34.0
+opentelemetry-api==1.42.1
 security-knowledge-os==0.3.0
 fastapi==0.141.1
 uvicorn==0.54.0

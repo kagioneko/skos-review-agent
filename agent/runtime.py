@@ -55,34 +55,95 @@ def offline_mode() -> bool:
     return MODEL == "offline"
 
 
-class LiveBudget:
-    """Daily cap on live (Gemini) turns for the whole process, plus a
-    concurrency cap. With --max-instances 1 this bounds the demo's spend."""
+class MemoryCounter:
+    """Daily counter for local runs and tests. Resets with the process, so
+    it is never used on Cloud Run (see budget_counter)."""
 
-    def __init__(self, daily: int, concurrency: int) -> None:
-        self.daily = daily
+    def __init__(self) -> None:
         self._day = ""
         self._used = 0
-        self._sem = asyncio.Semaphore(concurrency)
 
-    def take(self) -> None:
-        today = time.strftime("%Y-%m-%d", time.gmtime())
-        if today != self._day:
-            self._day, self._used = today, 0
-        if self._used >= self.daily:
-            raise Unavailable("today's live Gemini budget is used up; try scripted mode")
+    def take(self, day: str, daily: int) -> bool:
+        if day != self._day:
+            self._day, self._used = day, 0
+        if self._used >= daily:
+            return False
         self._used += 1
+        return True
 
-    @property
-    def sem(self) -> asyncio.Semaphore:
-        return self._sem
+
+class FirestoreCounter:
+    """Daily counter shared by every process and revision: one Firestore
+    document per UTC day, incremented in a transaction."""
+
+    def __init__(self) -> None:
+        from google.cloud import firestore
+
+        self._fs = firestore
+        self._db = firestore.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT"))
+
+    def take(self, day: str, daily: int) -> bool:
+        ref = self._db.collection("live_budget").document(day)
+
+        @self._fs.transactional
+        def txn(t: Any) -> bool:
+            snap = ref.get(transaction=t)
+            used = int((snap.to_dict() or {}).get("used", 0)) if snap.exists else 0
+            if used >= daily:
+                return False
+            t.set(ref, {"used": used + 1, "daily": daily})
+            return True
+
+        return txn(self._db.transaction())
+
+
+class BrokenCounter:
+    """Stands in when the shared counter cannot be set up: live is refused."""
+
+    def take(self, day: str, daily: int) -> bool:
+        raise RuntimeError("budget store unavailable")
+
+
+def budget_counter() -> Any:
+    """Firestore on Cloud Run (K_SERVICE is set there) or when asked for;
+    memory only for local runs. Fails closed: no store, no live turns."""
+    kind = os.environ.get(
+        "REVIEW_AGENT_BUDGET_STORE", "firestore" if os.environ.get("K_SERVICE") else "memory"
+    )
+    if kind == "memory":
+        return MemoryCounter()
+    try:
+        return FirestoreCounter()
+    except Exception:  # noqa: BLE001 - any setup failure means no live turns
+        return BrokenCounter()
+
+
+class LiveBudget:
+    """Daily cap on live (Gemini) turns shared by the whole service, plus a
+    concurrency cap that refuses (never queues) when full."""
+
+    def __init__(self, daily: int, concurrency: int, counter: Any = None) -> None:
+        self.daily = daily
+        self.counter = counter if counter is not None else MemoryCounter()
+        self.sem = asyncio.Semaphore(concurrency)
+
+    async def take(self) -> None:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        try:
+            ok = await asyncio.wait_for(
+                asyncio.to_thread(self.counter.take, day, self.daily), 10
+            )
+        except Exception:  # noqa: BLE001 - store down or slow: fail closed
+            raise Unavailable("the live Gemini budget cannot be checked; try scripted mode") from None
+        if not ok:
+            raise Unavailable("today's live Gemini budget is used up; try scripted mode")
 
 
 class Runtime:
     def __init__(self) -> None:
         self._runners: dict[str, InMemoryRunner] = {}
         self._sessions: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        self.budget = LiveBudget(LIVE_DAILY_TURNS, LIVE_CONCURRENCY)
+        self.budget = LiveBudget(LIVE_DAILY_TURNS, LIVE_CONCURRENCY, budget_counter())
 
     def _runner(self, scripted: bool) -> InMemoryRunner:
         # scripted (or offline): a fresh scripted model per session so each
@@ -104,7 +165,10 @@ class Runtime:
 
     def _expire(self) -> None:
         now = time.time()
-        for sid in [s for s, meta in self._sessions.items() if now - meta["at"] > SESSION_TTL]:
+        for sid in [
+            s for s, meta in self._sessions.items()
+            if now - meta["at"] > SESSION_TTL and not meta["lock"].locked()
+        ]:
             self._drop(sid)
 
     def _drop(self, sid: str) -> None:
@@ -135,32 +199,30 @@ class Runtime:
             raise KeyError("unknown or expired session")
         return self._sessions[sid]
 
-    def _start_turn(self, sid: str, meta: dict[str, Any]) -> InMemoryRunner:
-        if meta["turns"] >= MAX_TURNS_PER_SESSION:
-            raise PermissionError("turn limit for this session reached")
-        if not meta["scripted"]:
-            self.budget.take()
-        meta["turns"] += 1
-        meta["at"] = time.time()
-        self._sessions.move_to_end(sid)
-        return self._runners[sid]
-
     async def _run(
         self, sid: str, message: types.Content, confirmation_id: str | None = None
     ) -> dict[str, Any]:
+        """Checks run before anything is spent: session busy, approval id,
+        turn limit, a free live slot (refused, not queued). Only then the
+        daily budget, the turn and the approval id are used up. If the run
+        fails part-way its outcome is unknown, so the session is ended."""
         meta = self._meta(sid)
         if meta["lock"].locked():
             raise PermissionError("this session is already working on a request")
         async with meta["lock"]:
             if confirmation_id is not None and confirmation_id not in meta["pending"]:
                 raise NotPending("no such pending approval in this session")
-            runner = self._start_turn(sid, meta)
-            if confirmation_id is not None:
-                meta["pending"].discard(confirmation_id)  # answered once, never again
-            steps = await self._collect(runner, sid, message, live=not meta["scripted"])
-            meta["pending"].update(
-                s["confirmation_id"] for s in steps if s["kind"] == "hold"
-            )
+            if meta["turns"] >= MAX_TURNS_PER_SESSION:
+                raise PermissionError("turn limit for this session reached")
+            if meta["scripted"]:
+                steps = await self._turn(sid, meta, message, confirmation_id)
+            else:
+                if self.budget.sem.locked():
+                    raise Unavailable("the demo is busy; try again in a moment")
+                async with self.budget.sem:  # free slot: acquired without waiting
+                    await self.budget.take()
+                    steps = await self._turn(sid, meta, message, confirmation_id)
+        runner = self._runners[sid]
         session = await runner.session_service.get_session(
             app_name=APP, user_id=sid, session_id=sid
         )
@@ -175,9 +237,16 @@ class Runtime:
             "outbox": list(state.get(OUTBOX) or []),
         }
 
-    async def _collect(
-        self, runner: InMemoryRunner, sid: str, message: types.Content, live: bool
+    async def _turn(
+        self, sid: str, meta: dict[str, Any], message: types.Content,
+        confirmation_id: str | None,
     ) -> list[dict[str, Any]]:
+        meta["turns"] += 1
+        meta["at"] = time.time()
+        self._sessions.move_to_end(sid)
+        if confirmation_id is not None:
+            meta["pending"].discard(confirmation_id)  # answered once, never again
+        runner = self._runners[sid]
         steps: list[dict[str, Any]] = []
 
         async def go() -> None:
@@ -187,11 +256,12 @@ class Runtime:
             ):
                 steps.extend(_view(ev))
 
-        if not live:
+        try:
             await asyncio.wait_for(go(), RUN_TIMEOUT)
-            return steps
-        async with self.budget.sem:
-            await asyncio.wait_for(go(), RUN_TIMEOUT)
+        except BaseException:
+            self._drop(sid)  # partial run: outcome unknown, do not continue it
+            raise
+        meta["pending"].update(s["confirmation_id"] for s in steps if s["kind"] == "hold")
         return steps
 
     async def chat(self, sid: str, text: str) -> dict[str, Any]:
