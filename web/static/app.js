@@ -1,7 +1,10 @@
 // Everything shown here is rendered with textContent: reference pages are
 // outside content and may contain markup or instructions.
+// Each response and approval button belongs to the session that produced it;
+// anything from an older session is dropped, and one request runs at a time.
 "use strict";
 let sid = null;
+let busy = false;
 const $ = (id) => document.getElementById(id);
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
 
@@ -18,26 +21,46 @@ fetch("/api/info").then(r => r.json()).then(i => {
 });
 document.querySelectorAll("input[name=src]").forEach(r => r.addEventListener("change", () => { $("config").hidden = r.value !== "own" || !r.checked; }));
 
+function setBusy(b) {
+  busy = b;
+  for (const id of ["start", "send"]) $(id).disabled = b;
+  document.querySelectorAll("#holds button").forEach(x => { x.disabled = b; });
+}
+
+async function call(path, body, forSid) {
+  if (busy) return;
+  setBusy(true);
+  try {
+    const res = await api(path, body);
+    if (forSid === sid) render(res);
+  } catch (e) {
+    if (forSid === sid) $("timeline").append(el("li", "エラー: " + e.message, "bad"));
+  } finally { setBusy(false); }
+}
+
 $("start").onclick = async () => {
+  if (busy) return;
   const own = document.querySelector("input[name=src]:checked").value === "own";
   const scripted = document.querySelector("input[name=run]:checked").value === "scripted";
+  setBusy(true);
   try {
     const res = await api("/api/session", { config: own ? $("config").value : null, scripted });
     sid = res.session_id;
     $("chatbox").hidden = false; $("views").hidden = false; $("timeline").replaceChildren();
+    $("holds").replaceChildren(el("p", "なし", "muted"));
     $("runbanner").textContent = res.scripted
       ? "台本モード：Gemini は呼びません。仕込まれた指示に従ってしまうモデルを再生し、ゲートが止めるところを見せます。"
       : "本物の Gemini で動いています。";
     $("runbanner").hidden = false;
     render({ steps: [], gate: {}, outbox: [] });
   } catch (e) { alert("開始できません: " + e.message); }
+  finally { setBusy(false); }
 };
 
-$("send").onclick = async () => {
-  if (!sid) return;
+$("send").onclick = () => {
+  if (!sid || busy) return;
   $("timeline").append(el("li", "あなた: " + $("msg").value));
-  try { render(await api("/api/chat", { session_id: sid, message: $("msg").value })); }
-  catch (e) { $("timeline").append(el("li", "エラー: " + e.message, "bad")); }
+  call("/api/chat", { session_id: sid, message: $("msg").value }, sid);
 };
 
 function describe(step) {
@@ -66,7 +89,8 @@ function render(res) {
       if (reason) box.append(el("p", reason.reason));
       box.append(el("pre", JSON.stringify(h.args, null, 2)));
       const yes = el("button", "許可する"), no = el("button", "拒否する", "secondary");
-      yes.onclick = () => answer(h.confirmation_id, true, box); no.onclick = () => answer(h.confirmation_id, false, box);
+      const owner = sid;
+      yes.onclick = () => answer(owner, h.confirmation_id, true, box); no.onclick = () => answer(owner, h.confirmation_id, false, box);
       box.append(yes, no); $("holds").append(box);
     });
   }
@@ -74,10 +98,10 @@ function render(res) {
   $("outbox").replaceChildren(...(out.length ? out.map(o => el("li", o.destination + " ← " + o.body)) : [el("li", "空", "muted")]));
 }
 
-async function answer(id, ok, box) {
+function answer(owner, id, ok, box) {
+  if (busy || owner !== sid) return;
   box.remove();
   if (!$("holds").children.length) $("holds").replaceChildren(el("p", "なし", "muted"));
   $("timeline").append(el("li", ok ? "あなた: 許可しました" : "あなた: 拒否しました"));
-  try { render(await api("/api/confirm", { session_id: sid, confirmation_id: id, confirmed: ok })); }
-  catch (e) { $("timeline").append(el("li", "エラー: " + e.message, "bad")); }
+  call("/api/confirm", { session_id: owner, confirmation_id: id, confirmed: ok }, owner);
 }

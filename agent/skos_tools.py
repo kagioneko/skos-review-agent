@@ -6,19 +6,25 @@ decides what to look at next and explains the result.
 
 No value from the user's config reaches a tool result: SKOS reports facts
 (`secrets_in_config: true`), never the secret itself, and only server names
-from the config appear.
+from the config appear. SKOS reads the config from a file, so it is written
+to a private (0600) temp file that is deleted as soon as the scan ends.
+
+The work per scan is bounded: config size, number of servers, and the rule
+catalogue is loaded once per pack.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 PACKS_DIR = Path(__file__).resolve().parents[1] / "vendor" / "packs"
 PACK_ZIPS = ("mcp-2026.10.0.zip", "capgraph-2026.10.0.zip")
-MAX_CONFIG_CHARS = 200_000
+MAX_CONFIG_CHARS = 50_000
+MAX_SERVERS = 20
 
 _home: str | None = None
 
@@ -43,6 +49,7 @@ def ensure_packs() -> str:
     return home
 
 
+@lru_cache(maxsize=4)
 def _catalogue(pack_id: str) -> Any:
     from app.config import Settings
     from app.packs.loader import load_with_packs, only_pack
@@ -97,6 +104,8 @@ def scan(config_text: str, client: str = "none") -> dict[str, Any]:
             scans = scan_config(path)
         except ConfigError as exc:
             return {"error": f"invalid MCP config: {exc}"}  # messages carry no values
+    if len(scans) > MAX_SERVERS:
+        return {"error": f"too many servers: this demo reviews up to {MAX_SERVERS}"}
     agent = agent_labels(scans, client if client in ("claude-code", "none") else None)
     servers = []
     for s in scans:

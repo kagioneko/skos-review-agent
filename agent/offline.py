@@ -23,11 +23,24 @@ DEMO_SCRIPT: list[tuple[str, dict[str, Any]]] = [
     }),
 ]
 
-DEMO_FINAL_TEXT = (
+_FINAL_HEAD = (
     "【台本モード】この設定には CAPGRAPH-001（外部の内容＋機密＋外部送信）の組み合わせが"
     "あります。調査中に読んだ issue-42 の隠し指示に従って、スキャン結果を外部アドレスへ"
-    "送ろうとしましたが、自分のゲートがその送信を止めて、あなたに判断を求めました。"
+    "送ろうとしたところ、自分のゲートがその送信を止めてあなたに判断を求めました。"
 )
+FINAL_REJECTED = _FINAL_HEAD + "あなたが拒否したので、送信はしていません。"
+FINAL_APPROVED = _FINAL_HEAD + "あなたが許可したので、送信しました（デモでは送信箱に記録するだけです）。"
+
+
+def _send_outcome(llm_request: LlmRequest) -> str:
+    """How the last send_report call ended, from the tool response the
+    runner fed back: "sent", "rejected" or "" (none yet)."""
+    for content in reversed(llm_request.contents or []):
+        for part in content.parts or []:
+            fr = part.function_response
+            if fr and fr.name == "send_report":
+                return "sent" if (fr.response or {}).get("status") == "sent" else "rejected"
+    return ""
 
 
 class ScriptedLlm(BaseLlm):
@@ -35,6 +48,7 @@ class ScriptedLlm(BaseLlm):
 
     script: list[tuple[str, dict[str, Any]]]
     final: str = "done"
+    final_approved: str = ""
     step: int = 0
 
     async def generate_content_async(
@@ -44,10 +58,15 @@ class ScriptedLlm(BaseLlm):
             name, args = self.script[self.step]
             self.step += 1
             part = types.Part(function_call=types.FunctionCall(name=name, args=args))
+        elif self.final_approved and _send_outcome(llm_request) == "sent":
+            part = types.Part(text=self.final_approved)
         else:
             part = types.Part(text=self.final)
         yield LlmResponse(content=types.Content(role="model", parts=[part]))
 
 
 def demo_model() -> ScriptedLlm:
-    return ScriptedLlm(model="offline-demo", script=list(DEMO_SCRIPT), final=DEMO_FINAL_TEXT)
+    return ScriptedLlm(
+        model="offline-demo", script=list(DEMO_SCRIPT),
+        final=FINAL_REJECTED, final_approved=FINAL_APPROVED,
+    )

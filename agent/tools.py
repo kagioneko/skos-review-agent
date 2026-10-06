@@ -25,8 +25,12 @@ def scan_mcp_config(tool_context: ToolContext, client: str = "none") -> dict[str
     config = tool_context.state.get("user:mcp_config")
     if not config:
         return {"error": "no MCP config has been provided in this session"}
+    # the config is fixed per session: scan once per client value
+    cached = tool_context.state.get("review:last_scan")
+    if cached and cached.get("client") == client:
+        return cached["result"]
     result = skos_tools.scan(config, client)
-    tool_context.state["review:last_scan"] = result
+    tool_context.state["review:last_scan"] = {"client": client, "result": result}
     return result
 
 
