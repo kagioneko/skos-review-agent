@@ -134,7 +134,15 @@ def test_scan_never_returns_config_values() -> None:
 def test_read_reference_only_reads_bundled_pages(ref: str) -> None:
     from agent.tools import read_reference
 
-    assert "error" in read_reference(ref)
+    out = read_reference(ref)
+    assert "error" in out
+    assert out["available"] == ["fetch-readme", "issue-42"]
+
+
+def test_reference_ids_are_in_the_tool_description() -> None:
+    from agent.tools import read_reference
+
+    assert "Available ids: fetch-readme, issue-42." in read_reference.__doc__
 
 
 # ------------------------------------------------ approval round-trip

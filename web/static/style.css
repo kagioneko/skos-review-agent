@@ -12,7 +12,7 @@ label { display: block; margin: 4px 0; }
 textarea, input#msg { width: 100%; font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
 button { font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; margin-top: 8px; }
 button.secondary { background: transparent; color: var(--fg); border-color: var(--line); }
-.row { display: flex; gap: 8px; align-items: center; } .row button { margin-top: 0; }
+.row { display: flex; gap: 8px; align-items: center; } .row button { margin-top: 0; white-space: nowrap; flex-shrink: 0; }
 .grid { display: grid; grid-template-columns: 3fr 2fr; gap: 14px; }
 @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
 #timeline { padding-left: 1.2rem; } #timeline li { margin: 6px 0; }
