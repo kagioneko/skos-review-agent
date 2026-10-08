@@ -173,3 +173,194 @@ def test_failed_run_ends_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
             await r.chat(sid, "again")
 
     asyncio.run(go())
+
+
+# --- Codex round 3 nits -------------------------------------------------------
+
+
+def test_memory_or_unknown_budget_store_is_refused_on_cloud_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # N1: on Cloud Run a per-process counter would reset with every instance
+    import agent.runtime as rt
+
+    monkeypatch.setenv("K_SERVICE", "skos-review-agent")
+    monkeypatch.setenv("REVIEW_AGENT_BUDGET_STORE", "memory")
+    assert isinstance(rt.budget_counter(), rt.BrokenCounter)
+    monkeypatch.setenv("REVIEW_AGENT_BUDGET_STORE", "redis")
+    assert isinstance(rt.budget_counter(), rt.BrokenCounter)
+    monkeypatch.delenv("K_SERVICE")
+    assert isinstance(rt.budget_counter(), rt.BrokenCounter)  # unknown name, locally too
+    monkeypatch.setenv("REVIEW_AGENT_BUDGET_STORE", "memory")
+    assert isinstance(rt.budget_counter(), rt.MemoryCounter)
+
+
+def test_slow_budget_store_is_refused_not_waited_for(monkeypatch: pytest.MonkeyPatch) -> None:
+    # N3: LiveBudget stops waiting; the store's own RPC timeout bounds the thread
+    import time as _time
+
+    import agent.runtime as rt
+
+    class Slow:
+        def take(self, day: str, daily: int) -> bool:
+            _time.sleep(0.5)
+            return True
+
+    monkeypatch.setattr(rt, "BUDGET_TIMEOUT", 0.05)
+
+    async def go() -> None:
+        with pytest.raises(rt.Unavailable):
+            await rt.LiveBudget(daily=10, concurrency=1, counter=Slow()).take()
+
+    asyncio.run(go())
+
+
+def _run_guard(messages, timeout: float = 1.0):  # type: ignore[no-untyped-def]
+    """Drive the Guard middleware with a hand-written receive(); returns
+    (status or None, body the app saw or None)."""
+    import web.server as ws
+
+    seen: dict = {}
+
+    async def app(scope, receive, send):  # type: ignore[no-untyped-def]
+        seen["body"] = (await receive())["body"]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    sent: list = []
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        sent.append(message)
+
+    queue = list(messages)
+
+    async def receive():  # type: ignore[no-untyped-def]
+        if queue:
+            return queue.pop(0)
+        await asyncio.sleep(3600)  # a client that never sends the rest
+
+    scope = {"type": "http", "method": "POST", "path": "/api/chat", "headers": [],
+             "client": ("192.0.2.1", 1)}
+
+    async def go() -> None:
+        await asyncio.wait_for(ws.Guard(app)(scope, receive, send), timeout)
+
+    asyncio.run(go())
+    status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+    return status, seen.get("body")
+
+
+@pytest.fixture
+def _guard_state(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    import web.server as ws
+
+    monkeypatch.setattr(ws, "_calls", {})
+    monkeypatch.setattr(ws, "_all_calls", ws.deque())
+    monkeypatch.setattr(ws, "_creates", {})
+    return ws
+
+
+def test_guard_reassembles_a_chunked_body(_guard_state) -> None:  # type: ignore[no-untyped-def]
+    msgs = [{"type": "http.request", "body": b"ab", "more_body": True},
+            {"type": "http.request", "body": b"cd", "more_body": False}]
+    assert _run_guard(msgs) == (200, b"abcd")
+
+
+def test_guard_refuses_oversize_chunks_before_the_app(  # type: ignore[no-untyped-def]
+    _guard_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_guard_state, "MAX_BODY", 10)
+    msgs = [{"type": "http.request", "body": b"x" * 6, "more_body": True},
+            {"type": "http.request", "body": b"x" * 6, "more_body": True}]
+    assert _run_guard(msgs) == (413, None)
+
+
+def test_guard_times_out_a_trickled_body(  # type: ignore[no-untyped-def]
+    _guard_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N2: a body that never finishes is answered 408 within BODY_TIMEOUT
+    monkeypatch.setattr(_guard_state, "BODY_TIMEOUT", 0.05)
+    msgs = [{"type": "http.request", "body": b"{", "more_body": True}]
+    assert _run_guard(msgs) == (408, None)
+
+
+def test_guard_stops_on_disconnect(_guard_state) -> None:  # type: ignore[no-untyped-def]
+    msgs = [{"type": "http.request", "body": b"{", "more_body": True},
+            {"type": "http.disconnect"}]
+    assert _run_guard(msgs) == (None, None)
+
+
+def test_session_creation_is_limited_per_client(_guard_state) -> None:  # type: ignore[no-untyped-def]
+    ws = _guard_state
+    assert all(ws.create_check("a", 100.0) is None for _ in range(ws.CREATE_LIMIT))
+    assert ws.create_check("a", 100.0) is not None
+    assert ws.create_check("b", 100.0) is None  # other clients unaffected
+    assert ws.create_check("a", 100.0 + ws.CREATE_WINDOW + 1) is None
+
+
+def test_unused_sessions_expire_quickly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # N4: an untouched session holds a table slot for minutes, not an hour
+    import agent.runtime as rt
+    from web.server import SAMPLE
+
+    async def go() -> None:
+        r = rt.Runtime()
+        idle = await r.create("{}", scripted=True)
+        used = await r.create(SAMPLE, scripted=True)
+        await r.chat(used, "review")
+        for sid in (idle, used):
+            r._sessions[sid]["at"] -= rt.UNUSED_SESSION_TTL + 1
+        r._expire()
+        assert idle not in r._sessions and used in r._sessions
+
+    asyncio.run(go())
+
+
+def test_live_turns_are_capped_per_client_without_spending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # N4: one client cannot use the whole daily budget
+    import agent.runtime as rt
+
+    monkeypatch.setattr(rt, "LIVE_PER_CLIENT", 1)
+
+    async def go() -> None:
+        r = rt.Runtime()
+        counter = rt.MemoryCounter()
+        r.budget = rt.LiveBudget(daily=10, concurrency=1, counter=counter)
+        sid, hid = await _live_session_with_hold(r)
+        r._sessions[sid]["client"] = "203.0.113.9"
+        await r.confirm(sid, hid, False)  # first live turn: allowed
+        assert counter._used == 1
+        with pytest.raises(rt.Unavailable):
+            await r.chat(sid, "again")  # over this client's share
+        assert counter._used == 1 and r._sessions[sid]["turns"] == 2
+        other, _ = await _live_session_with_hold(r)
+        r._sessions[other]["client"] = "198.51.100.7"
+        await r.chat(other, "hi")  # another client still has its share
+        assert counter._used == 2
+
+    asyncio.run(go())
+
+
+def test_reply_is_read_while_the_session_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # N5: the state snapshot belongs to this turn only
+    import agent.runtime as rt
+    from web.server import SAMPLE
+
+    async def go() -> None:
+        r = rt.Runtime()
+        sid = await r.create(SAMPLE, scripted=True)
+        service = r._runners[sid].session_service
+        real = service.get_session
+        locked: list[bool] = []
+
+        async def spy(**kw):  # type: ignore[no-untyped-def]
+            locked.append(r._sessions[sid]["lock"].locked())
+            return await real(**kw)
+
+        monkeypatch.setattr(service, "get_session", spy)
+        await r.chat(sid, "review")
+        assert locked and all(locked)
+
+    asyncio.run(go())

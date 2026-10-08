@@ -100,9 +100,10 @@ function render(res) {
   $("outbox").replaceChildren(...(out.length ? out.map(o => el("li", o.destination + " ← " + o.body)) : [el("li", "空", "muted")]));
 }
 
-// The approval card stays until the server has taken the answer: on 429/503
-// nothing was used up, so the user can answer again. 409 = already answered;
-// 504/500 = outcome unknown and the session has ended.
+// The approval card stays until the server has taken the answer: on
+// 408/429/503 the approval id and the turn were not used up (the shared live
+// budget may have been, if its store was slow), so the user can answer again.
+// 409 = already answered; 504/500 = outcome unknown and the session has ended.
 async function answer(owner, id, ok, box) {
   if (busy || owner !== sid) return;
   setBusy(true);
@@ -114,7 +115,7 @@ async function answer(owner, id, ok, box) {
     render(res);
   } catch (e) {
     if (owner !== sid) return;
-    if (e.status !== 429 && e.status !== 503) box.remove();
+    if (![408, 429, 503].includes(e.status)) box.remove();
     $("timeline").append(el("li", "エラー: " + e.message, "bad"));
   } finally {
     if (!$("holds").children.length) $("holds").replaceChildren(el("p", "なし", "muted"));

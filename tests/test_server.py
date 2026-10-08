@@ -38,6 +38,7 @@ def _fresh_rate_limits():  # type: ignore[no-untyped-def]
 
     ws._calls.clear()
     ws._all_calls.clear()
+    ws._creates.clear()
     yield
 
 

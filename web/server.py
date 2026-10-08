@@ -11,8 +11,9 @@ GET  /api/info     -> mode (gemini model or offline demo)
 Nothing the user sends is stored beyond the in-memory session or logged.
 
 Public-demo protections, applied before any request body is parsed: a body
-size cap (counted as bytes arrive, not trusted from Content-Length) and a
-rate limit per client plus a global one. The client address comes from
+size cap (counted as bytes arrive, not trusted from Content-Length), a time
+limit for receiving the body, a rate limit per client plus a global one, and
+a tighter per-client limit on creating sessions. The client address comes from
 X-Forwarded-For only as far as TRUSTED_PROXY_HOPS trusted proxies put it
 there (Cloud Run: 1 - its front end appends the address it saw); anything
 to the left of that is client-supplied and ignored. Validation errors never
@@ -21,6 +22,7 @@ echo the input back.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections import deque
@@ -45,11 +47,15 @@ GLOBAL_RATE_LIMIT = int(os.environ.get("REVIEW_AGENT_GLOBAL_RATE", "120"))  # al
 MAX_CLIENTS = 10_000
 MAX_BODY = 256 * 1024  # bytes; a 50k-character config fits with JSON escaping
 TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
+BODY_TIMEOUT = float(os.environ.get("REVIEW_AGENT_BODY_TIMEOUT", "10"))  # seconds for the whole body
+CREATE_WINDOW = 600.0
+CREATE_LIMIT = int(os.environ.get("REVIEW_AGENT_CREATE_LIMIT", "5"))  # sessions per client per window
 
 app = FastAPI(title="SKOS Review Agent", docs_url=None, redoc_url=None, openapi_url=None)
 runtime = Runtime()
 _calls: dict[str, deque[float]] = {}
 _all_calls: deque[float] = deque()
+_creates: dict[str, deque[float]] = {}
 
 
 @app.on_event("startup")
@@ -96,6 +102,44 @@ def rate_check(client: str, now: float | None = None) -> str | None:
     return None
 
 
+def create_check(client: str, now: float | None = None) -> str | None:
+    """None if this client may open another session now, else why not."""
+    now = time.time() if now is None else now
+    q = _creates.get(client)
+    if q is None:
+        if len(_creates) >= MAX_CLIENTS:
+            for key in [k for k, v in _creates.items() if not v or now - v[-1] > CREATE_WINDOW]:
+                del _creates[key]
+            if len(_creates) >= MAX_CLIENTS:
+                return "the demo is busy, try again later"
+        q = _creates[client] = deque()
+    while q and now - q[0] > CREATE_WINDOW:
+        q.popleft()
+    if len(q) >= CREATE_LIMIT:
+        return "too many new sessions, try again in a few minutes"
+    q.append(now)
+    return None
+
+
+_TOO_LARGE = object()
+
+
+async def _read_body(receive):  # type: ignore[no-untyped-def]
+    """The whole body, None if the client went away, or _TOO_LARGE.
+    Size is checked before each chunk is kept."""
+    body = bytearray()
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return None
+        chunk = message.get("body", b"")
+        if len(body) + len(chunk) > MAX_BODY:
+            return _TOO_LARGE
+        body += chunk
+        if not message.get("more_body", False):
+            return bytes(body)
+
+
 class Guard:
     """ASGI middleware: rate limit and body cap for /api/ POSTs, before the
     body is read or parsed (so 422s and oversized bodies count too)."""
@@ -110,9 +154,13 @@ class Guard:
             return await self.app(scope, receive, send)
         headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
         peer = scope.get("client")[0] if scope.get("client") else None
-        reason = rate_check(client_ip(headers, peer))
+        client = client_ip(headers, peer)
+        reason = rate_check(client)
+        if reason is None and scope["path"] == "/api/session":
+            reason = create_check(client)
         if reason:
             return await JSONResponse({"detail": reason}, status_code=429)(scope, receive, send)
+        scope.setdefault("state", {})["client"] = client
         try:
             declared = int(headers.get("content-length", "0"))
         except ValueError:
@@ -121,27 +169,28 @@ class Guard:
             return await JSONResponse({"detail": "request too large"}, status_code=413)(
                 scope, receive, send
             )
-        # read the whole body here, counting bytes as they arrive, so an
-        # oversized stream is answered 413 before the app sees any of it
-        body = bytearray()
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                return None
-            body += message.get("body", b"")
-            if len(body) > MAX_BODY:
-                return await JSONResponse({"detail": "request too large"}, status_code=413)(
-                    scope, receive, send
-                )
-            if not message.get("more_body", False):
-                break
+        # read the whole body here, counting bytes as they arrive and within a
+        # time limit, so an oversized or trickled body is answered before the
+        # app sees any of it
+        try:
+            body = await asyncio.wait_for(_read_body(receive), BODY_TIMEOUT)
+        except TimeoutError:
+            return await JSONResponse({"detail": "request body too slow"}, status_code=408)(
+                scope, receive, send
+            )
+        if body is None:
+            return None
+        if body is _TOO_LARGE:
+            return await JSONResponse({"detail": "request too large"}, status_code=413)(
+                scope, receive, send
+            )
         sent = False
 
         async def replay():  # type: ignore[no-untyped-def]
             nonlocal sent
             if not sent:
                 sent = True
-                return {"type": "http.request", "body": bytes(body), "more_body": False}
+                return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
         return await self.app(scope, replay, send)
@@ -185,10 +234,11 @@ def info() -> dict:
 
 
 @app.post("/api/session")
-async def new_session(body: NewSession) -> dict:
+async def new_session(body: NewSession, request: Request) -> dict:
     scripted = body.scripted or offline_mode()
+    client = getattr(request.state, "client", "?")
     try:
-        sid = await runtime.create(body.config or SAMPLE, scripted=scripted)
+        sid = await runtime.create(body.config or SAMPLE, scripted=scripted, client=client)
     except Unavailable as exc:
         raise HTTPException(503, str(exc)) from None
     return {"session_id": sid, "scripted": scripted}

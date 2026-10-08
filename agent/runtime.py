@@ -9,7 +9,12 @@ evicting someone else's.
 Public-demo limits on top of that: a confirmation id can be answered once
 and only if this session issued it; one request per session at a time; and
 live (Gemini) turns share a daily budget, a concurrency cap, a per-run
-model-call cap and a timeout.
+model-call cap and a timeout. Each client also has its own daily share of
+live turns, and a session nobody has used yet expires quickly, so one client
+cannot hold the session table or the whole budget.
+
+The daily turn cap bounds Gemini calls only; it is not a cap on the total
+bill (Cloud Run and Firestore are billed separately).
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from agent.tools import OUTBOX, TOOLS
 APP = "skos-review-agent"
 MAX_SESSIONS = int(os.environ.get("REVIEW_AGENT_MAX_SESSIONS", "200"))
 SESSION_TTL = int(os.environ.get("REVIEW_AGENT_SESSION_TTL", "3600"))
+UNUSED_SESSION_TTL = int(os.environ.get("REVIEW_AGENT_UNUSED_SESSION_TTL", "300"))
 MAX_MESSAGE_CHARS = 4000
 MAX_TURNS_PER_SESSION = int(os.environ.get("REVIEW_AGENT_MAX_TURNS", "30"))
 CONFIRMATION = "adk_request_confirmation"
@@ -41,6 +47,10 @@ LIVE_CONCURRENCY = int(os.environ.get("REVIEW_AGENT_LIVE_CONCURRENCY", "2"))
 MAX_LLM_CALLS = int(os.environ.get("REVIEW_AGENT_MAX_LLM_CALLS", "12"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_OUTPUT_TOKENS", "2048"))
 RUN_TIMEOUT = float(os.environ.get("REVIEW_AGENT_RUN_TIMEOUT", "120"))
+LIVE_PER_CLIENT = int(os.environ.get("REVIEW_AGENT_LIVE_PER_CLIENT", "20"))
+BUDGET_TIMEOUT = 10.0  # seconds to wait for the shared counter
+FIRESTORE_RPC_TIMEOUT = 5.0
+MAX_CLIENT_ENTRIES = 10_000
 
 
 class Unavailable(Exception):
@@ -57,7 +67,7 @@ def offline_mode() -> bool:
 
 class MemoryCounter:
     """Daily counter for local runs and tests. Resets with the process, so
-    it is never used on Cloud Run (see budget_counter)."""
+    budget_counter() refuses to use it on Cloud Run."""
 
     def __init__(self) -> None:
         self._day = ""
@@ -74,7 +84,11 @@ class MemoryCounter:
 
 class FirestoreCounter:
     """Daily counter shared by every process and revision: one Firestore
-    document per UTC day, incremented in a transaction."""
+    document per UTC day, incremented in a transaction. The read has its own
+    RPC timeout and is not retried, and the transaction is attempted at most
+    twice, so a slow store does not keep a worker thread busy for long after
+    LiveBudget has stopped waiting (the commit uses the client's default
+    deadline)."""
 
     def __init__(self) -> None:
         from google.cloud import firestore
@@ -87,14 +101,14 @@ class FirestoreCounter:
 
         @self._fs.transactional
         def txn(t: Any) -> bool:
-            snap = ref.get(transaction=t)
+            snap = ref.get(transaction=t, retry=None, timeout=FIRESTORE_RPC_TIMEOUT)
             used = int((snap.to_dict() or {}).get("used", 0)) if snap.exists else 0
             if used >= daily:
                 return False
             t.set(ref, {"used": used + 1, "daily": daily})
             return True
 
-        return txn(self._db.transaction())
+        return txn(self._db.transaction(max_attempts=2))
 
 
 class BrokenCounter:
@@ -106,12 +120,14 @@ class BrokenCounter:
 
 def budget_counter() -> Any:
     """Firestore on Cloud Run (K_SERVICE is set there) or when asked for;
-    memory only for local runs. Fails closed: no store, no live turns."""
-    kind = os.environ.get(
-        "REVIEW_AGENT_BUDGET_STORE", "firestore" if os.environ.get("K_SERVICE") else "memory"
-    )
+    memory only for local runs. Fails closed: no store, an unknown store
+    name, or memory asked for on Cloud Run all mean no live turns."""
+    on_cloud_run = bool(os.environ.get("K_SERVICE"))
+    kind = os.environ.get("REVIEW_AGENT_BUDGET_STORE", "firestore" if on_cloud_run else "memory")
     if kind == "memory":
-        return MemoryCounter()
+        return BrokenCounter() if on_cloud_run else MemoryCounter()
+    if kind != "firestore":
+        return BrokenCounter()
     try:
         return FirestoreCounter()
     except Exception:  # noqa: BLE001 - any setup failure means no live turns
@@ -131,7 +147,7 @@ class LiveBudget:
         day = time.strftime("%Y-%m-%d", time.gmtime())
         try:
             ok = await asyncio.wait_for(
-                asyncio.to_thread(self.counter.take, day, self.daily), 10
+                asyncio.to_thread(self.counter.take, day, self.daily), BUDGET_TIMEOUT
             )
         except Exception:  # noqa: BLE001 - store down or slow: fail closed
             raise Unavailable("the live Gemini budget cannot be checked; try scripted mode") from None
@@ -144,6 +160,7 @@ class Runtime:
         self._runners: dict[str, InMemoryRunner] = {}
         self._sessions: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.budget = LiveBudget(LIVE_DAILY_TURNS, LIVE_CONCURRENCY, budget_counter())
+        self._client_live: dict[str, tuple[str, int]] = {}  # client -> (UTC day, live turns)
 
     def _runner(self, scripted: bool) -> InMemoryRunner:
         # scripted (or offline): a fresh scripted model per session so each
@@ -167,7 +184,8 @@ class Runtime:
         now = time.time()
         for sid in [
             s for s, meta in self._sessions.items()
-            if now - meta["at"] > SESSION_TTL and not meta["lock"].locked()
+            if now - meta["at"] > (SESSION_TTL if meta["turns"] else UNUSED_SESSION_TTL)
+            and not meta["lock"].locked()
         ]:
             self._drop(sid)
 
@@ -175,7 +193,17 @@ class Runtime:
         self._sessions.pop(sid, None)
         self._runners.pop(sid, None)
 
-    async def create(self, config_text: str, scripted: bool = False) -> str:
+    def _client_live_ok(self, client: str, day: str) -> bool:
+        seen_day, used = self._client_live.get(client, (day, 0))
+        return seen_day != day or used < LIVE_PER_CLIENT
+
+    def _count_client_live(self, client: str, day: str) -> None:
+        seen_day, used = self._client_live.get(client, (day, 0))
+        if len(self._client_live) >= MAX_CLIENT_ENTRIES and client not in self._client_live:
+            self._client_live = {c: v for c, v in self._client_live.items() if v[0] == day}
+        self._client_live[client] = (day, (used if seen_day == day else 0) + 1)
+
+    async def create(self, config_text: str, scripted: bool = False, client: str = "?") -> str:
         self._expire()
         if len(self._sessions) >= MAX_SESSIONS:
             raise Unavailable("the demo is busy; try again later")
@@ -189,7 +217,7 @@ class Runtime:
         self._runners[sid] = runner
         self._sessions[sid] = {
             "at": time.time(), "turns": 0, "scripted": scripted,
-            "pending": set(), "lock": asyncio.Lock(),
+            "pending": set(), "lock": asyncio.Lock(), "client": client,
         }
         return sid
 
@@ -205,7 +233,8 @@ class Runtime:
         """Checks run before anything is spent: session busy, approval id,
         turn limit, a free live slot (refused, not queued). Only then the
         daily budget, the turn and the approval id are used up. If the run
-        fails part-way its outcome is unknown, so the session is ended."""
+        fails part-way its outcome is unknown, so the session is ended. The
+        reply is read inside the lock so it belongs to this turn only."""
         meta = self._meta(sid)
         if meta["lock"].locked():
             raise PermissionError("this session is already working on a request")
@@ -217,16 +246,20 @@ class Runtime:
             if meta["scripted"]:
                 steps = await self._turn(sid, meta, message, confirmation_id)
             else:
+                day = time.strftime("%Y-%m-%d", time.gmtime())
+                if not self._client_live_ok(meta["client"], day):
+                    raise Unavailable("your share of today's live Gemini turns is used up; try scripted mode")
                 if self.budget.sem.locked():
                     raise Unavailable("the demo is busy; try again in a moment")
                 async with self.budget.sem:  # free slot: acquired without waiting
                     await self.budget.take()
+                    self._count_client_live(meta["client"], day)
                     steps = await self._turn(sid, meta, message, confirmation_id)
-        runner = self._runners[sid]
-        session = await runner.session_service.get_session(
-            app_name=APP, user_id=sid, session_id=sid
-        )
-        state = session.state if session else {}
+            runner = self._runners[sid]
+            session = await runner.session_service.get_session(
+                app_name=APP, user_id=sid, session_id=sid
+            )
+            state = session.state if session else {}
         return {
             "steps": steps,
             "gate": {
