@@ -9,9 +9,11 @@ evicting someone else's.
 Public-demo limits on top of that: a confirmation id can be answered once
 and only if this session issued it; one request per session at a time; and
 live (Gemini) turns share a daily budget, a concurrency cap, a per-run
-model-call cap and a timeout. Each client also has its own daily share of
-live turns, and a session nobody has used yet expires quickly, so one client
-cannot hold the session table or the whole budget.
+model-call cap and a timeout. A session nobody has used yet expires
+quickly, and each client has a daily share of live turns. That share is
+counted in this process only (best effort: it resets on restart and is not
+shared between instances - the service runs with max-instances 1); the
+shared daily budget is the hard limit.
 
 The daily turn cap bounds Gemini calls only; it is not a cap on the total
 bill (Cloud Run and Firestore are billed separately).
@@ -21,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from google.adk.agents import LlmAgent
@@ -49,12 +53,17 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_OUTPUT_TOKENS", "2048")
 RUN_TIMEOUT = float(os.environ.get("REVIEW_AGENT_RUN_TIMEOUT", "120"))
 LIVE_PER_CLIENT = int(os.environ.get("REVIEW_AGENT_LIVE_PER_CLIENT", "20"))
 BUDGET_TIMEOUT = 10.0  # seconds to wait for the shared counter
+BUDGET_WORKERS = 2  # store calls that may still be running after a timeout
 FIRESTORE_RPC_TIMEOUT = 5.0
 MAX_CLIENT_ENTRIES = 10_000
 
 
 class Unavailable(Exception):
     """The demo is at a capacity or budget limit; try later (HTTP 503)."""
+
+
+class BudgetExhausted(Unavailable):
+    """The store answered: no live turns left today. Nothing was taken."""
 
 
 class NotPending(Exception):
@@ -136,23 +145,39 @@ def budget_counter() -> Any:
 
 class LiveBudget:
     """Daily cap on live (Gemini) turns shared by the whole service, plus a
-    concurrency cap that refuses (never queues) when full."""
+    concurrency cap that refuses (never queues) when full.
+
+    Store calls run on a small pool of their own. Waiting stops after
+    BUDGET_TIMEOUT, but a call already sent to the store may still finish and
+    count a turn; such leftovers are limited to BUDGET_WORKERS at a time, and
+    while the pool is busy new checks are refused instead of queued."""
 
     def __init__(self, daily: int, concurrency: int, counter: Any = None) -> None:
         self.daily = daily
         self.counter = counter if counter is not None else MemoryCounter()
         self.sem = asyncio.Semaphore(concurrency)
+        self._pool = ThreadPoolExecutor(BUDGET_WORKERS, thread_name_prefix="budget")
+        self._in_flight = 0
+        self._guard = threading.Lock()
 
-    async def take(self) -> None:
-        day = time.strftime("%Y-%m-%d", time.gmtime())
+    def _done(self, _future: Any) -> None:
+        with self._guard:
+            self._in_flight -= 1
+
+    async def take(self, day: str | None = None) -> None:
+        day = day or time.strftime("%Y-%m-%d", time.gmtime())
+        with self._guard:
+            if self._in_flight >= BUDGET_WORKERS:
+                raise Unavailable("the live Gemini budget cannot be checked; try scripted mode")
+            self._in_flight += 1
+        future = self._pool.submit(self.counter.take, day, self.daily)
+        future.add_done_callback(self._done)
         try:
-            ok = await asyncio.wait_for(
-                asyncio.to_thread(self.counter.take, day, self.daily), BUDGET_TIMEOUT
-            )
+            ok = await asyncio.wait_for(asyncio.wrap_future(future), BUDGET_TIMEOUT)
         except Exception:  # noqa: BLE001 - store down or slow: fail closed
             raise Unavailable("the live Gemini budget cannot be checked; try scripted mode") from None
         if not ok:
-            raise Unavailable("today's live Gemini budget is used up; try scripted mode")
+            raise BudgetExhausted("today's live Gemini budget is used up; try scripted mode")
 
 
 class Runtime:
@@ -193,15 +218,22 @@ class Runtime:
         self._sessions.pop(sid, None)
         self._runners.pop(sid, None)
 
-    def _client_live_ok(self, client: str, day: str) -> bool:
+    def _reserve_client_live(self, client: str, day: str) -> bool:
+        """Check and count one live turn for this client in one step (no
+        await in between, so two sessions of one client cannot both pass)."""
         seen_day, used = self._client_live.get(client, (day, 0))
-        return seen_day != day or used < LIVE_PER_CLIENT
-
-    def _count_client_live(self, client: str, day: str) -> None:
-        seen_day, used = self._client_live.get(client, (day, 0))
+        used = used if seen_day == day else 0
+        if used >= LIVE_PER_CLIENT:
+            return False
         if len(self._client_live) >= MAX_CLIENT_ENTRIES and client not in self._client_live:
             self._client_live = {c: v for c, v in self._client_live.items() if v[0] == day}
-        self._client_live[client] = (day, (used if seen_day == day else 0) + 1)
+        self._client_live[client] = (day, used + 1)
+        return True
+
+    def _release_client_live(self, client: str, day: str) -> None:
+        seen_day, used = self._client_live.get(client, (day, 0))
+        if seen_day == day and used > 0:
+            self._client_live[client] = (day, used - 1)
 
     async def create(self, config_text: str, scripted: bool = False, client: str = "?") -> str:
         self._expire()
@@ -247,13 +279,21 @@ class Runtime:
                 steps = await self._turn(sid, meta, message, confirmation_id)
             else:
                 day = time.strftime("%Y-%m-%d", time.gmtime())
-                if not self._client_live_ok(meta["client"], day):
-                    raise Unavailable("your share of today's live Gemini turns is used up; try scripted mode")
                 if self.budget.sem.locked():
                     raise Unavailable("the demo is busy; try again in a moment")
+                if not self._reserve_client_live(meta["client"], day):
+                    raise Unavailable(
+                        "your share of today's live Gemini turns is used up; try scripted mode"
+                    )
                 async with self.budget.sem:  # free slot: acquired without waiting
-                    await self.budget.take()
-                    self._count_client_live(meta["client"], day)
+                    try:
+                        await self.budget.take(day)
+                    except BudgetExhausted:
+                        # the store said no: nothing was taken, give the share back
+                        self._release_client_live(meta["client"], day)
+                        raise
+                    # any other failure (timeout, store error) may still have
+                    # counted a turn, so the reserved share is kept
                     steps = await self._turn(sid, meta, message, confirmation_id)
             runner = self._runners[sid]
             session = await runner.session_service.get_session(

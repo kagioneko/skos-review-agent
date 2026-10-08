@@ -236,7 +236,9 @@ def _run_guard(messages, timeout: float = 1.0):  # type: ignore[no-untyped-def]
 
     async def receive():  # type: ignore[no-untyped-def]
         if queue:
-            return queue.pop(0)
+            message = dict(queue.pop(0))
+            await asyncio.sleep(message.pop("_delay", 0))
+            return message
         await asyncio.sleep(3600)  # a client that never sends the rest
 
     scope = {"type": "http", "method": "POST", "path": "/api/chat", "headers": [],
@@ -362,5 +364,120 @@ def test_reply_is_read_while_the_session_is_locked(monkeypatch: pytest.MonkeyPat
         monkeypatch.setattr(service, "get_session", spy)
         await r.chat(sid, "review")
         assert locked and all(locked)
+
+    asyncio.run(go())
+
+
+# --- Codex round 4 nits -------------------------------------------------------
+
+
+def test_guard_limits_the_total_time_not_each_chunk(  # type: ignore[no-untyped-def]
+    _guard_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # every chunk arrives well within the limit, the body as a whole does not
+    monkeypatch.setattr(_guard_state, "BODY_TIMEOUT", 0.2)
+    msgs = [{"type": "http.request", "body": b"x", "more_body": True, "_delay": 0.05}
+            for _ in range(10)]
+    assert _run_guard(msgs) == (408, None)
+
+
+class _SlowCounter:
+    def __init__(self, delay: float) -> None:
+        self.delay, self.calls, self._used = delay, 0, 0
+
+    def take(self, day: str, daily: int) -> bool:
+        import time as _time
+
+        self.calls += 1
+        _time.sleep(self.delay)
+        if self._used >= daily:
+            return False
+        self._used += 1
+        return True
+
+
+def test_one_client_cannot_pass_its_share_with_parallel_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # round 4 #1: check and count happen in one step, before any await
+    import agent.runtime as rt
+
+    monkeypatch.setattr(rt, "LIVE_PER_CLIENT", 1)
+
+    async def go() -> None:
+        r = rt.Runtime()
+        counter = _SlowCounter(0.2)  # both requests would be waiting here at once
+        r.budget = rt.LiveBudget(daily=10, concurrency=2, counter=counter)
+        a, _ = await _live_session_with_hold(r)
+        b, _ = await _live_session_with_hold(r)
+        for sid in (a, b):
+            r._sessions[sid]["client"] = "203.0.113.9"
+        results = await asyncio.gather(r.chat(a, "x"), r.chat(b, "y"), return_exceptions=True)
+        refused = [x for x in results if isinstance(x, rt.Unavailable)]
+        assert len(refused) == 1 and counter.calls == 1 and counter._used == 1
+
+    asyncio.run(go())
+
+
+def test_exhausted_budget_gives_the_client_share_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent.runtime as rt
+
+    monkeypatch.setattr(rt, "LIVE_PER_CLIENT", 1)
+
+    async def go() -> None:
+        r = rt.Runtime()
+        counter = rt.MemoryCounter()
+        r.budget = rt.LiveBudget(daily=0, concurrency=1, counter=counter)
+        sid, _ = await _live_session_with_hold(r)
+        with pytest.raises(rt.BudgetExhausted):
+            await r.chat(sid, "x")  # the store said no: nothing taken
+        r.budget.daily = 1
+        await r.chat(sid, "y")  # so the client's one live turn is still there
+        assert counter._used == 1
+
+    asyncio.run(go())
+
+
+def test_uncertain_budget_check_keeps_the_client_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    # a timed-out store call may still count a turn later: do not hand the share back
+    import agent.runtime as rt
+
+    monkeypatch.setattr(rt, "LIVE_PER_CLIENT", 1)
+    monkeypatch.setattr(rt, "BUDGET_TIMEOUT", 0.05)
+
+    async def go() -> None:
+        r = rt.Runtime()
+        r.budget = rt.LiveBudget(daily=10, concurrency=1, counter=_SlowCounter(0.3))
+        sid, _ = await _live_session_with_hold(r)
+        with pytest.raises(rt.Unavailable) as first:
+            await r.chat(sid, "x")
+        assert not isinstance(first.value, rt.BudgetExhausted)
+        other, _ = await _live_session_with_hold(r)  # same default client "?"
+        with pytest.raises(rt.Unavailable, match="your share"):
+            await r.chat(other, "y")
+
+    asyncio.run(go())
+
+
+def test_leftover_store_calls_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # round 4 #2: while earlier calls are still running, new checks are refused
+    # at once (not queued, so they cannot count a turn later)
+    import agent.runtime as rt
+
+    monkeypatch.setattr(rt, "BUDGET_WORKERS", 1)
+    monkeypatch.setattr(rt, "BUDGET_TIMEOUT", 0.05)
+    counter = _SlowCounter(0.3)
+
+    async def go() -> None:
+        budget = rt.LiveBudget(daily=10, concurrency=2, counter=counter)
+        with pytest.raises(rt.Unavailable):
+            await budget.take()  # times out, call still running
+        with pytest.raises(rt.Unavailable):
+            await budget.take()  # refused without reaching the store
+        assert counter.calls == 1
+        await asyncio.sleep(0.4)  # the leftover finished
+        counter.delay = 0.0  # and the store is quick again
+        await budget.take()
+        assert counter.calls == 2
 
     asyncio.run(go())
