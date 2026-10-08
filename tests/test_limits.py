@@ -375,9 +375,11 @@ def test_guard_limits_the_total_time_not_each_chunk(  # type: ignore[no-untyped-
     _guard_state, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # every chunk arrives well within the limit, the body as a whole does not
+    # (a per-chunk timeout would let the complete body through to the app)
     monkeypatch.setattr(_guard_state, "BODY_TIMEOUT", 0.2)
     msgs = [{"type": "http.request", "body": b"x", "more_body": True, "_delay": 0.05}
-            for _ in range(10)]
+            for _ in range(9)]
+    msgs.append({"type": "http.request", "body": b"x", "more_body": False, "_delay": 0.05})
     assert _run_guard(msgs) == (408, None)
 
 
@@ -479,5 +481,70 @@ def test_leftover_store_calls_are_bounded(monkeypatch: pytest.MonkeyPatch) -> No
         counter.delay = 0.0  # and the store is quick again
         await budget.take()
         assert counter.calls == 2
+
+    asyncio.run(go())
+
+
+# --- Codex round 5 nits -------------------------------------------------------
+
+
+def test_full_pool_refusal_gives_the_client_share_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    # refused before reaching the store: nothing counted, so the share returns
+    import threading
+
+    import agent.runtime as rt
+
+    monkeypatch.setattr(rt, "BUDGET_WORKERS", 1)
+    monkeypatch.setattr(rt, "BUDGET_TIMEOUT", 0.05)
+    monkeypatch.setattr(rt, "LIVE_PER_CLIENT", 2)
+    release = threading.Event()
+
+    class Stuck:
+        calls = 0
+
+        def take(self, day: str, daily: int) -> bool:
+            Stuck.calls += 1
+            release.wait(5)
+            return True
+
+    async def go() -> None:
+        r = rt.Runtime()
+        r.budget = rt.LiveBudget(daily=10, concurrency=2, counter=Stuck())
+        a, _ = await _live_session_with_hold(r)
+        b, hb = await _live_session_with_hold(r)
+        with pytest.raises(rt.Unavailable):
+            await r.chat(a, "x")  # times out: share kept (outcome unknown)
+        with pytest.raises(rt.NotTaken):
+            await r.confirm(b, hb, True)  # pool full: refused, share returned
+        assert Stuck.calls == 1
+        assert r._client_live["?"][1] == 1
+        assert hb in r._sessions[b]["pending"]  # approval id not used up
+        release.set()
+        await asyncio.sleep(0.1)
+        await r.confirm(b, hb, False)  # the returned share is usable
+        assert r._client_live["?"][1] == 2
+
+    asyncio.run(go())
+
+
+def test_failed_hand_off_to_the_pool_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent.runtime as rt
+
+    counter = rt.MemoryCounter()
+
+    async def go() -> None:
+        budget = rt.LiveBudget(daily=10, concurrency=1, counter=counter)
+
+        def boom(*a, **k):  # type: ignore[no-untyped-def]
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(budget._pool, "submit", boom)
+        with pytest.raises(rt.Unavailable) as first:
+            await budget.take()
+        assert not isinstance(first.value, rt.NotTaken)  # may have been queued
+        monkeypatch.undo()
+        with pytest.raises(rt.NotTaken):
+            await budget.take()  # stays refused until restart
+        assert counter._used == 0
 
     asyncio.run(go())

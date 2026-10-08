@@ -62,8 +62,12 @@ class Unavailable(Exception):
     """The demo is at a capacity or budget limit; try later (HTTP 503)."""
 
 
-class BudgetExhausted(Unavailable):
-    """The store answered: no live turns left today. Nothing was taken."""
+class NotTaken(Unavailable):
+    """Refused with certainty that nothing was counted against the budget."""
+
+
+class BudgetExhausted(NotTaken):
+    """The store answered: no live turns left today."""
 
 
 class NotPending(Exception):
@@ -95,9 +99,9 @@ class FirestoreCounter:
     """Daily counter shared by every process and revision: one Firestore
     document per UTC day, incremented in a transaction. The read has its own
     RPC timeout and is not retried, and the transaction is attempted at most
-    twice, so a slow store does not keep a worker thread busy for long after
-    LiveBudget has stopped waiting (the commit uses the client's default
-    deadline)."""
+    twice. Begin and commit use the client library's default deadlines, so
+    how long a call can keep running after LiveBudget stopped waiting is NOT
+    bounded here; LiveBudget only bounds how many such calls there are."""
 
     def __init__(self) -> None:
         from google.cloud import firestore
@@ -149,8 +153,11 @@ class LiveBudget:
 
     Store calls run on a small pool of their own. Waiting stops after
     BUDGET_TIMEOUT, but a call already sent to the store may still finish and
-    count a turn; such leftovers are limited to BUDGET_WORKERS at a time, and
-    while the pool is busy new checks are refused instead of queued."""
+    count a turn; such leftovers are limited to BUDGET_WORKERS at a time
+    (their duration is not bounded), and while the pool is busy new checks are
+    refused instead of queued. If handing a call to the pool itself fails, the
+    pool may or may not have kept it, so live turns stay refused until the
+    process restarts."""
 
     def __init__(self, daily: int, concurrency: int, counter: Any = None) -> None:
         self.daily = daily
@@ -158,6 +165,7 @@ class LiveBudget:
         self.sem = asyncio.Semaphore(concurrency)
         self._pool = ThreadPoolExecutor(BUDGET_WORKERS, thread_name_prefix="budget")
         self._in_flight = 0
+        self._broken = False
         self._guard = threading.Lock()
 
     def _done(self, _future: Any) -> None:
@@ -167,10 +175,16 @@ class LiveBudget:
     async def take(self, day: str | None = None) -> None:
         day = day or time.strftime("%Y-%m-%d", time.gmtime())
         with self._guard:
-            if self._in_flight >= BUDGET_WORKERS:
-                raise Unavailable("the live Gemini budget cannot be checked; try scripted mode")
+            if self._broken or self._in_flight >= BUDGET_WORKERS:
+                # not handed to the store: certainly nothing counted
+                raise NotTaken("the live Gemini budget cannot be checked; try scripted mode")
             self._in_flight += 1
-        future = self._pool.submit(self.counter.take, day, self.daily)
+        try:
+            future = self._pool.submit(self.counter.take, day, self.daily)
+        except Exception:  # noqa: BLE001 - the work may or may not be queued
+            with self._guard:
+                self._broken = True  # the slot stays taken: outcome unknown
+            raise Unavailable("the live Gemini budget cannot be checked; try scripted mode") from None
         future.add_done_callback(self._done)
         try:
             ok = await asyncio.wait_for(asyncio.wrap_future(future), BUDGET_TIMEOUT)
@@ -288,8 +302,8 @@ class Runtime:
                 async with self.budget.sem:  # free slot: acquired without waiting
                     try:
                         await self.budget.take(day)
-                    except BudgetExhausted:
-                        # the store said no: nothing was taken, give the share back
+                    except NotTaken:
+                        # certainly nothing was counted: give the share back
                         self._release_client_live(meta["client"], day)
                         raise
                     # any other failure (timeout, store error) may still have
